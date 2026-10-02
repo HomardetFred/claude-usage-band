@@ -1,0 +1,7 @@
+{
+  "name": "claude-usage-band",
+  "owner": { "name": "Veit Voss", "email": "design@veit-voss.de" },
+  "plugins": [
+    { "name": "usage-band", "source": "./plugins/usage-band", "description": "5h / weekly usage, context fill and prompt-cache warmth above the prompt" }
+  ]
+}
