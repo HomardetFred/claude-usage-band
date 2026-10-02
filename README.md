@@ -63,7 +63,9 @@ claude plugin update usage-band@claude-usage-band
 
 ## Notes
 
-- **The cache timer is an estimate.** It assumes a 1-hour cache TTL on a Claude subscription and 5 minutes on an API key. It counts from your last response.
+- **The cache timer is checked against the real numbers.** The countdown runs from your last response. After every message, the API's own cache counts show whether it was actually read from cache (`✓ hit 98%`) or paid in full (`✗ missed 452k`). An unexpected miss also shows a toast.
+- **The TTL is learned.** It starts by assuming 1 hour on a subscription and 5 minutes on an API key. When a message sent after a longer pause still hits, or misses, the band switches to the TTL it actually saw and remembers it.
+- **It remembers between restarts.** The limits and the cache timer show up right away when you open a session, not only after your first message. Limits are shared across projects: a session you switch back to picks up newer numbers within a minute.
 - **The 5h and 7d rings need a subscription.** On an API key, only Context and Cache are shown.
 
 ## License

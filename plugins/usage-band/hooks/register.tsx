@@ -1,11 +1,14 @@
 import { atom, read, update } from 'claude-code'
-import type { Register, SessionUsage } from 'claude-code'
+import type { EngineInterface, Register, SessionRateLimit, SessionUsage } from 'claude-code'
 
 import type { Snap } from '../types'
 
 // Prompt-cache TTL guess: subscriptions (rate limits reported) get 1h, API keys 5m.
+// Replaced by what the API's own cache counts show once a gap proves it (s.ttl).
 const TTL_SUB = 60 * 60_000
 const TTL_API = 5 * 60_000
+// Below this many prompt tokens a hit or miss says nothing worth showing.
+const MIN_PROMPT = 20_000
 // Past this many context tokens, nudge toward /compact or /clear.
 const NAG = 400_000
 const NAG_HARD = 600_000
@@ -50,32 +53,90 @@ ${ICONS[c.icon](c.color)}</svg>`
 
 const ring = (f: number) => '○◔◑◕●'[Math.round(Math.max(0, Math.min(1, f)) * 4)]
 
-const fold = (u: Pick<SessionUsage, 'context' | 'rateLimits'>) => (s: Snap): Snap => {
-  const h5 = u.rateLimits.find(r => r.kind === 'five_hour')
-  const wk = u.rateLimits.find(r => r.kind === 'seven_day')
+type Limits = readonly SessionRateLimit[]
+
+// An update without limits keeps the ones already shown.
+const withLimits = (s: Snap, rl: Limits): Snap => {
+  if (!rl.length) return s
+  const h5 = rl.find(r => r.kind === 'five_hour')
+  const wk = rl.find(r => r.kind === 'seven_day')
   return {
-    ...s,
+    ...s, sub: true,
     h5: h5?.percentUsed, h5Reset: h5?.resetsAt,
     wk: wk?.percentUsed, wkReset: wk?.resetsAt,
-    ctxPct: u.context.percent, ctxTok: u.context.tokens, ctxWin: u.context.window,
-    sub: u.rateLimits.length > 0,
   }
 }
 
+// Claude Code only learns the limits from a response; until then use the last known ones.
+const fold = (u: Pick<SessionUsage, 'context' | 'rateLimits'>, cached?: Limits) => (s: Snap): Snap => ({
+  ...withLimits(s, u.rateLimits.length ? u.rateLimits : cached ?? []),
+  ctxPct: u.context.percent, ctxTok: u.context.tokens, ctxWin: u.context.window,
+})
+
+// The limits are the account's, shared by every session: the newest response in
+// any project writes them, and every open session picks them up within a minute.
+type SavedLimits = { at: number; rl: Limits }
+const parseLimits = (v: unknown): SavedLimits | undefined =>
+  Array.isArray(v) ? { at: 0, rl: v as Limits }
+    : v && typeof v === 'object' && Array.isArray((v as SavedLimits).rl) ? (v as SavedLimits) : undefined
+
+// Stored limits whose window has since reset start that window over at 0%.
+const aged = (rl: Limits, now: number): Limits =>
+  rl.map(r => (r.resetsAt && Date.parse(r.resetsAt) <= now ? { kind: r.kind, percentUsed: 0 } : r))
+
+// When each conversation last got a response, kept across restarts so a resumed
+// session knows its cache is still warm. Newest 30 conversations only.
+type Seen = Record<string, number>
+const remember = async ($: EngineInterface, t: number) => {
+  const [id, got] = await Promise.all([$.session.id(), $.store.get('lastAt')])
+  const seen = { ...((got ?? {}) as Seen), [id]: t }
+  const keep = Object.entries(seen).sort((a, b) => b[1] - a[1]).slice(0, 30)
+  await $.store.set('lastAt', Object.fromEntries(keep))
+}
+
+// A conversation with nothing stored yet: its transcript was last written by the
+// last response, so the file's modification time stands in for it. One stat call.
+const transcriptAt = async ($: EngineInterface, id: string): Promise<number> => {
+  try {
+    const [cwd, cfg, profile, home] = await Promise.all([
+      $.session.cwd(), $.env.get('CLAUDE_CONFIG_DIR'), $.env.get('USERPROFILE'), $.env.get('HOME'),
+    ])
+    const base = cfg ?? `${profile ?? home}/.claude`
+    const st = await $.fs.stat(`${base}/projects/${cwd.replace(/[^A-Za-z0-9]/g, '-')}/${id}.jsonl`)
+    return st.kind === 'file' ? st.mtimeMs : 0
+  } catch {
+    return 0
+  }
+}
+
+// Last limits written to the store, so a response that moved nothing writes nothing.
+let storedLimits = ''
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    const now = await $.clock.now()
-    const ago = e.seconds_since_last_response
-    const u = await $.session.usage()
+    const [now, u, ttl, seen, limits, id] = await Promise.all([
+      $.clock.now(), $.session.usage(), $.store.get('ttl'), $.store.get('lastAt'), $.store.get('limits'), $.session.id(),
+    ])
+    const got = parseLimits(limits)
+    const cached = got && aged(got.rl, now)
+    // A restart loses the session's state; the stored time brings it back.
+    // A /clear starts a new conversation id with no transcript yet, so it starts cold.
+    const saved = ((seen ?? {}) as Seen)[id] || (u.context.tokens ? await transcriptAt($, id) : 0)
     await update($, snap, s => ({
-      ...fold(u)(s),
+      ...fold(u, cached)(s),
       now,
-      lastAt: e.source === 'clear' ? 0 : ago === undefined ? s.lastAt : now - ago * 1000,
+      limitsAt: u.rateLimits.length ? now : got?.at ?? 0,
+      ttl: ttl === '5m' || ttl === '1h' ? ttl : s.ttl,
+      lastAt: Math.max(s.lastAt, Math.min(saved, now)),
     }))
     // One redraw a minute keeps the countdowns honest; no model calls, no tokens.
+    // It also picks up limits another project's session saved since.
     $.clock.every(60_000, async () => {
-      const t = await $.clock.now()
-      await update($, snap, s => ({ ...s, now: t }))
+      const [t, v] = await Promise.all([$.clock.now(), $.store.get('limits')])
+      const saved = parseLimits(v)
+      await update($, snap, s => (saved && saved.at > (s.limitsAt ?? 0)
+        ? { ...withLimits(s, aged(saved.rl, t)), limitsAt: saved.at, now: t }
+        : { ...s, now: t }))
     })
     return next(e)
   })
@@ -91,16 +152,54 @@ export const register: Register = on => {
     }
     await update($, snap, s => ({
       ...fold(e)(s), now, lastAt: isResponse ? now : s.lastAt,
+      limitsAt: e.rateLimits.length ? now : s.limitsAt,
       warned: tok >= NAG,
       snooze: tok < NAG ? 0 : s.snooze,
     }))
+    const rl = JSON.stringify(e.rateLimits)
+    if (e.rateLimits.length && rl !== storedLimits) {
+      storedLimits = rl
+      await $.store.set('limits', { at: now, rl: e.rateLimits })
+    }
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     const now = await $.clock.now()
     await update($, snap, s => ({ ...s, lastAt: now, now }))
+    await remember($, now)
     return next(e)
+  })
+
+  // The first response of each turn says what the cache really did with the
+  // conversation sent after the idle gap: read from cache (hit) or paid in full (miss).
+  on('turn.step', async function* ($, e, next) {
+    const first = e.index === 0 && !e.agentId
+    const [before, sentAt] = first ? await Promise.all([read($, snap), $.clock.now()]) : [undefined, 0]
+    const r = yield* next(e)
+    const u = r.usage
+    if (!before || !u) return r
+    const total = u.cache_read_input_tokens + u.cache_creation_input_tokens + u.input_tokens
+    if (total < MIN_PROMPT) return r
+    const hit = u.cache_read_input_tokens / total >= 0.5
+    const gap = before.lastAt ? sentAt - before.lastAt : -1
+    const sameModel = !before.model || before.model === u.model
+    // A gap longer than 5m that still hits proves the 1h cache; a miss inside
+    // the hour on the same model means the cache only lasted 5m.
+    let ttl = before.ttl
+    if (sameModel && hit && gap > 6 * 60_000) ttl = '1h'
+    else if (sameModel && !hit && gap > 6 * 60_000 && gap < 55 * 60_000 && u.cache_read_input_tokens / total < 0.2) ttl = '5m'
+    if (ttl && ttl !== before.ttl) await $.store.set('ttl', ttl)
+    const ttlMs = (ttl ?? (before.sub ? '1h' : '5m')) === '1h' ? TTL_SUB : TTL_API
+    const thoughtWarm = gap >= 0 && gap < ttlMs
+    if (!hit && thoughtWarm && sameModel && total >= 50_000) {
+      $.ui.toast(`Cache miss: that message re-read ${k(total - u.cache_read_input_tokens)} tokens at full price.`)
+    }
+    await update($, snap, s => ({
+      ...s, ttl, model: u.model, hit: u.cache_read_input_tokens / total,
+      missTok: hit ? undefined : total - u.cache_read_input_tokens,
+    }))
+    return r
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -118,12 +217,21 @@ export const register: Register = on => {
     }]
     const tok = s.ctxTok ?? 0
     const nag = !e.props.isWorking && tok >= Math.max(NAG, s.snooze ?? 0)
-    if (s.h5 !== undefined) cells.push({ icon: 'clock', value: `${s.h5}%`, sub: `5h · ${until(s.h5Reset)}`, frac: s.h5 / 100, color: tone(s.h5) })
-    if (s.wk !== undefined) cells.push({ icon: 'cal', value: `${s.wk}%`, sub: `7d · ${until(s.wkReset)}`, frac: s.wk / 100, color: tone(s.wk) })
-    const ttl = s.sub ? TTL_SUB : TTL_API
+    // A window whose reset time has passed is back at 0% until the next response says more.
+    const limit = (icon: string, label: string, pct?: number, reset?: string) => {
+      if (pct === undefined) return
+      const isReset = !!reset && Date.parse(reset) <= now
+      const p = isReset ? 0 : pct
+      cells.push({ icon, value: `${p}%`, sub: isReset ? label : `${label} · ${until(reset)}`, frac: p / 100, color: tone(p) })
+    }
+    limit('clock', '5h', s.h5, s.h5Reset)
+    limit('cal', '7d', s.wk, s.wkReset)
+    const ttl = (s.ttl ?? (s.sub ? '1h' : '5m')) === '1h' ? TTL_SUB : TTL_API
     const rem = s.lastAt ? s.lastAt + ttl - now : 0
+    // What the last message actually did: ✓ read from cache, ✗ paid full price.
+    const last = s.hit === undefined ? '' : s.missTok ? ` · ✗ missed ${k(s.missTok)}` : ` · ✓ hit ${Math.round(s.hit * 100)}%`
     if (e.props.isWorking) cells.push({ icon: 'flame', value: 'Warm', sub: 'cache · active', frac: 1, color: WARMC, hot: true })
-    else if (rem > 0) cells.push({ icon: 'flame', value: 'Warm', sub: `cache · ${left(rem).replace(' ', '')} left`, frac: rem / ttl, color: WARMC, hot: true })
+    else if (rem > 0) cells.push({ icon: 'flame', value: 'Warm', sub: `cache · ${left(rem).replace(' ', '')} left${last}`, frac: rem / ttl, color: WARMC, hot: true })
     else cells.push({ icon: 'snow', value: 'Cold', sub: s.lastAt ? 'cache · expired' : 'cache · no reply yet', frac: 0, color: COOL, hot: true })
 
     const { Box, Text, Button } = $.ui.resolve(e)

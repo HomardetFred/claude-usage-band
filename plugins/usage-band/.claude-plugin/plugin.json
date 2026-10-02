@@ -1,6 +1,6 @@
 {
   "name": "usage-band",
-  "version": "0.6.1",
+  "version": "0.7.3",
   "description": "5h / weekly usage, context fill and prompt-cache warmth above the prompt",
   "author": {
     "name": "Veit Voss",
