@@ -239,7 +239,9 @@ export const register: Register = on => {
     // cache about to expire (compact now while it's cheap), or just big.
     const isCold = s.lastAt > 0 && rem <= 0
     const isExpiring = !isCold && rem > 0 && rem <= 10 * 60_000
-    const compactBtn = <Button key="compact" label="Compact" variant={isCold ? 'secondary' : 'primary'} onPress={() => void $.session.compact()} />
+    // compact() rejects while a turn runs and resolves { skip } when a hook vetoes it:
+    // surface the veto, and fall back to filling /compact so the press is never lost.
+    const compactBtn = <Button key="compact" label="Compact" variant={isCold ? 'secondary' : 'primary'} onPress={() => void $.session.compact().then(r => r.skip && $.ui.toast(r.skip), () => $.prompt.fill({ text: '/compact' }))} />
     const clearBtn = <Button key="clear" label="Clear" variant={isCold ? 'primary' : 'secondary'} onPress={() => void $.prompt.fill({ text: '/clear' })} />
     const nagRow = nag ? (
       <Box flexDirection="row" alignItems="center" gap={1} paddingX={1}>
