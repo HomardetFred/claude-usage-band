@@ -73,6 +73,16 @@ const fold = (u: Pick<SessionUsage, 'context' | 'rateLimits'>, cached?: Limits) 
   ctxPct: u.context.percent, ctxTok: u.context.tokens, ctxWin: u.context.window,
 })
 
+// The window auto-compaction measures against (settings' autoCompactWindow, the env,
+// or the model's own): a summary breakdown is estimated locally, no API call.
+const compactWindow = async ($: EngineInterface): Promise<number | undefined> => {
+  try {
+    return (await $.session.usage({ breakdown: 'summary' })).context.breakdown?.rawMaxTokens
+  } catch {
+    return undefined
+  }
+}
+
 // The limits are the account's, shared by every session: the newest response in
 // any project writes them, and every open session picks them up within a minute.
 type SavedLimits = { at: number; rl: Limits }
@@ -114,8 +124,9 @@ let storedLimits = ''
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    const [now, u, ttl, seen, limits, id] = await Promise.all([
+    const [now, u, ttl, seen, limits, id, cw] = await Promise.all([
       $.clock.now(), $.session.usage(), $.store.get('ttl'), $.store.get('lastAt'), $.store.get('limits'), $.session.id(),
+      compactWindow($),
     ])
     const got = parseLimits(limits)
     const cached = got && aged(got.rl, now)
@@ -124,7 +135,7 @@ export const register: Register = on => {
     const saved = ((seen ?? {}) as Seen)[id] || (u.context.tokens ? await transcriptAt($, id) : 0)
     await update($, snap, s => ({
       ...fold(u, cached)(s),
-      now,
+      now, compactWin: cw,
       limitsAt: u.rateLimits.length ? now : got?.at ?? 0,
       ttl: ttl === '5m' || ttl === '1h' ? ttl : s.ttl,
       lastAt: Math.max(s.lastAt, Math.min(saved, now)),
@@ -146,12 +157,14 @@ export const register: Register = on => {
     const now = await $.clock.now()
     const isResponse = e.changed.includes('context')
     const tok = e.context.tokens ?? 0
-    const prev = await read($, snap)
+    // A model switch can change the compaction window: re-read it with each response.
+    const [prev, cw] = await Promise.all([read($, snap), isResponse ? compactWindow($) : undefined])
     if (tok >= NAG && !prev.warned) {
       $.ui.toast(`Context is at ${k(tok)} tokens: every turn re-sends all of it. Consider compacting or clearing.`)
     }
     await update($, snap, s => ({
       ...fold(e)(s), now, lastAt: isResponse ? now : s.lastAt,
+      compactWin: cw ?? s.compactWin,
       limitsAt: e.rateLimits.length ? now : s.limitsAt,
       warned: tok >= NAG,
       snooze: tok < NAG ? 0 : s.snooze,
@@ -208,10 +221,12 @@ export const register: Register = on => {
     const now = Math.max(s.now, s.lastAt)
     const until = (iso?: string) => (iso ? `resets ${left(Date.parse(iso) - now).replace(' ', '')}` : '')
 
-    const cp = s.ctxPct ?? 0
+    // Measured against the compaction window when it is smaller than the model's.
+    const win = s.compactWin && s.compactWin < s.ctxWin ? s.compactWin : s.ctxWin
+    const cp = win !== s.ctxWin ? Math.min(100, Math.round((s.ctxTok ?? 0) / win * 100)) : s.ctxPct ?? 0
     const cells: Cell[] = [{
       icon: 'ctx', value: `${cp}%`,
-      sub: s.ctxWin ? `${k(s.ctxTok ?? 0)} / ${k(s.ctxWin)}` : '',
+      sub: win ? `${k(s.ctxTok ?? 0)} / ${k(win)}` : '',
       frac: cp / 100,
       color: (s.ctxTok ?? 0) >= NAG_HARD ? BAD : (s.ctxTok ?? 0) >= NAG ? (tone(cp) === BAD ? BAD : WARN) : tone(cp),
     }]

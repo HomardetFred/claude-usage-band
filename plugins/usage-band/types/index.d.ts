@@ -6,6 +6,8 @@ export type Snap = {
   ctxPct?: number
   ctxTok?: number
   ctxWin: number
+  /** Window auto-compaction runs against (autoCompactWindow); unset = the model's. */
+  compactWin?: number
   sub: boolean
   lastAt: number
   now: number
