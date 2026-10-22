@@ -40,7 +40,7 @@ In terminal Claude Code it shows the same four items with text rings (`○ ◔ �
 ## Install
 
 ```bash
-claude plugin marketplace add Vosssa/claude-usage-band
+claude plugin marketplace add HomardetFred/claude-usage-band
 claude plugin install usage-band@claude-usage-band --scope user
 ```
 

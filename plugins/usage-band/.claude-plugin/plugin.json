@@ -6,7 +6,7 @@
     "name": "Veit Voss",
     "email": "design@veit-voss.de"
   },
-  "repository": "https://github.com/Vosssa/claude-usage-band",
+  "repository": "https://github.com/HomardetFred/claude-usage-band",
   "license": "MIT",
   "types": "./types/index.d.ts"
 }
