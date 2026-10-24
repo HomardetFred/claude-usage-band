@@ -177,6 +177,26 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // The engine reports no context fill after a compaction until the next response:
+  // show the size it recorded afterwards, or else the local estimate.
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    if (r.skip !== undefined || e.agentId || e.trigger === 'precompute') return r
+    let tok = r.tokensAfter
+    if (tok === undefined) {
+      try {
+        tok = (await $.session.usage({ breakdown: 'summary' })).context.breakdown?.totalTokens
+      } catch {}
+    }
+    if (tok === undefined) return r
+    const t = tok
+    await update($, snap, s => ({
+      ...s, ctxTok: t, ctxPct: s.ctxWin ? Math.min(100, Math.round(t / s.ctxWin * 100)) : s.ctxPct,
+      warned: t >= NAG, snooze: t < NAG ? 0 : s.snooze,
+    }))
+    return r
+  })
+
   on('turn.complete', async ($, e, next) => {
     const now = await $.clock.now()
     await update($, snap, s => ({ ...s, lastAt: now, now }))
